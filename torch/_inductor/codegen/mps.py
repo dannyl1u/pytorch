@@ -1,18 +1,34 @@
 # This is not a feature-complete compiler backend
 # Just an early prototype that shows that one can compile elementwise ops into a Metal shader
-from typing import Any, Optional
+from __future__ import annotations
 
-import sympy
+from typing import Any, Optional, TYPE_CHECKING
+
+from sympy.printing.precedence import PRECEDENCE
 
 import torch
 from torch.utils._sympy.printers import ExprPrinter as ExprPrinter_
 
-from ..ops_handler import StoreMode
-from ..scheduler import Scheduler, SchedulerNode
 from ..utils import get_bounds_index_expr, get_kernel_metadata
 from ..virtualized import ops, V
-from .common import CSEVariable, DeferredLine, IndentedBuffer, OpOverrides
+from .common import (
+    CSEVariable,
+    DeferredLine,
+    IndentedBuffer,
+    OpOverrides,
+    PythonPrinter,
+)
 from .simd import IterationRangesEntry, SIMDKernel, SIMDScheduling
+
+
+if TYPE_CHECKING:
+    from typing import Union
+
+    import sympy
+
+    from ..ops_handler import StoreMode
+    from ..scheduler import Scheduler, SchedulerNode
+    from .common import OpVarT
 
 
 DTYPE_TO_METAL = {
@@ -28,7 +44,7 @@ DTYPE_TO_METAL = {
 }
 
 
-def value_to_metal(val: CSEVariable) -> str:
+def value_to_metal(val: Union[float, int, bool, str, CSEVariable]) -> str:
     if isinstance(val, float):
         if val == torch.inf:
             return "HUGE_VALF"
@@ -77,6 +93,27 @@ class MetalExprPrinter(ExprPrinter_):
         assert len(expr.args) == 1
         return f"metal::abs({self._print(expr.args[0])})"
 
+    def _print_RoundToInt(self, expr: sympy.Expr) -> str:
+        assert len(expr.args) == 1
+        return f"static_cast<long>(metal::rint({self._print(expr.args[0])}))"
+
+    def _print_RoundDecimal(self, expr: sympy.Expr) -> str:
+        assert len(expr.args) == 2
+        number, ndigits = expr.args
+        if number.is_integer:
+            # ndigits < 0 should have been filtered by the sympy function
+            assert ndigits < 0
+            raise ValueError(
+                f"For integer inputs, only non-negative ndigits are currently supported, but got {ndigits}."
+            )
+        number_str = self.parenthesize(number, PRECEDENCE["Mul"])
+        return f"static_cast<float>(metal::rint(1e{ndigits} * {number_str}) * 1e{-ndigits})"
+
+    def _print_IntTrueDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # TODO: This is only accurate up to 2**23
+        return f"static_cast<float>({self._print(lhs)}) / static_cast<float>({self._print(rhs)})"
+
 
 class MetalOverrides(OpOverrides):
     @staticmethod
@@ -95,7 +132,7 @@ class MetalOverrides(OpOverrides):
         return f"*reinterpret_cast<thread {DTYPE_TO_METAL[dtype]}*>(&{x})"
 
     @staticmethod
-    def constant(val: CSEVariable, dtype: torch.dtype) -> str:
+    def constant(val: Union[bool, float, int], dtype: torch.dtype) -> str:
         return value_to_metal(val)
 
     @staticmethod
@@ -118,31 +155,41 @@ class MetalOverrides(OpOverrides):
         return ops.where(new_mask, result, other)
 
     @staticmethod
-    def where(a: CSEVariable, b: CSEVariable, c: CSEVariable) -> str:
+    def where(a: OpVarT, b: OpVarT, c: OpVarT) -> str:
         return f"{a} ? {b} : {value_to_metal(c)}"
 
     @staticmethod
-    def remainder(a: CSEVariable, b: CSEVariable) -> str:
-        if b.dtype is not None and not b.dtype.is_floating_point:
+    def remainder(a: OpVarT, b: OpVarT) -> str:
+        if (
+            isinstance(b, CSEVariable)
+            and b.dtype is not None
+            and not b.dtype.is_floating_point
+        ):
             return f"{a} % {b}"
         # Upcast to float otherwise results of remainder op are wrong for half
-        float_a = f"static_cast<float>({a})" if a.dtype != torch.float else a
-        float_b = f"static_cast<float>({b})" if b.dtype != torch.float else b
+        float_a = (
+            f"static_cast<float>({a})"
+            if isinstance(a, CSEVariable) and a.dtype != torch.float
+            else a
+        )
+        float_b = (
+            f"static_cast<float>({b})"
+            if isinstance(b, CSEVariable) and b.dtype != torch.float
+            else b
+        )
         return f"{float_a} - {float_b} * metal::floor({float_a} / {float_b})"
 
     @staticmethod
     def maximum(a: CSEVariable, b: CSEVariable) -> str:
         typecast_a = f"static_cast<decltype({a}+{b})>({a})"
         typecast_b = f"static_cast<decltype({a}+{b})>({b})"
-        max_res = f"metal::max({typecast_a}, {typecast_b})"
-        return f"isnan({a} + {b}) ? {a} + {b} : {max_res}"
+        return f"c10::metal::max({typecast_a}, {typecast_b})"
 
     @staticmethod
     def minimum(a: CSEVariable, b: CSEVariable) -> str:
         typecast_a = f"static_cast<decltype({a}+{b})>({a})"
         typecast_b = f"static_cast<decltype({a}+{b})>({b})"
-        min_res = f"metal::min({typecast_a}, {typecast_b})"
-        return f"isnan({a} + {b})  ? {a} + {b} : {min_res}"
+        return f"c10::metal::min({typecast_a}, {typecast_b})"
 
     @staticmethod
     def logical_or(a: CSEVariable, b: CSEVariable) -> str:
@@ -183,6 +230,34 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     def cos(x: CSEVariable) -> str:
         return f"metal::precise::cos({x})"
+
+    @staticmethod
+    def i0(x: CSEVariable) -> str:
+        return f"c10::metal::i0({x})"
+
+    @staticmethod
+    def i1(x: CSEVariable) -> str:
+        return f"c10::metal::i1({x})"
+
+    @staticmethod
+    def erf(x: CSEVariable) -> str:
+        return f"c10::metal::erf({x})"
+
+    @staticmethod
+    def erfinv(x: CSEVariable) -> str:
+        return f"c10::metal::erfinv({x})"
+
+    @staticmethod
+    def lgamma(x: CSEVariable) -> str:
+        return f"c10::metal::log_gamma({x})"
+
+    @staticmethod
+    def polygamma(n: CSEVariable, x: CSEVariable) -> str:
+        # polygamma's API takes order as first argument
+        # and the input tensor as second, while the
+        # metal shader has these inverted.
+        # TODO (dcci): make this more uniform.
+        return f"c10::metal::polygamma({x}, {n})"
 
     @staticmethod
     def tan(x: CSEVariable) -> str:
@@ -254,14 +329,35 @@ class MetalOverrides(OpOverrides):
         return f"metal::ceil({x})"
 
     @staticmethod
+    def rand(seed: CSEVariable, offset: CSEVariable) -> str:
+        return f"c10::metal::rand({seed}, {offset})"
+
+    @staticmethod
+    def randn(seed: CSEVariable, offset: CSEVariable) -> str:
+        return f"c10::metal::randn({seed}, {offset})"
+
+    @staticmethod
+    def randint64(
+        seed: CSEVariable, offset: CSEVariable, low: CSEVariable, high: CSEVariable
+    ) -> str:
+        return f"c10::metal::randint64({seed}, {offset}, {low}, {high})"
+
+    @staticmethod
     def round(x: CSEVariable) -> str:
         return f"metal::round({x})"
+
+    @staticmethod
+    def pow(a: CSEVariable, b: CSEVariable) -> str:
+        cast_a = f"static_cast<decltype({a}+{b})>({a})"
+        cast_b = f"static_cast<decltype({a}+{b})>({b})"
+        return f"metal::pow({cast_a}, {cast_b})"
 
 
 class MetalKernel(SIMDKernel):
     overrides = MetalOverrides  # type: ignore[assignment]
     suffix = ";"
     newvar_prefix = "auto "
+    pexpr = PythonPrinter().doprint
     sexpr = MetalExprPrinter().doprint
     kexpr = sexpr
 
@@ -282,7 +378,7 @@ class MetalKernel(SIMDKernel):
         """Codegen a load from an InputBuffer"""
         var = self.args.input(name)
         index = self.prepare_indexing(index)
-        line = f"{var}[{self.sexpr(index)}]"
+        line = f"{var}[{self.index_to_str(index)}]"
         return self.cse.generate(self.body, line, dtype=V.graph.get_dtype(name))
 
     def store(
@@ -291,7 +387,7 @@ class MetalKernel(SIMDKernel):
         var = self.args.output(name)
         index = self.prepare_indexing(index)
         dtype_str = self.dtype_to_str(V.graph.get_dtype(name))
-        line = f"{var}[{index}] = static_cast<{dtype_str}>({value});"
+        line = f"{var}[{self.index_to_str(index)}] = static_cast<{dtype_str}>({value});"
         self.body.writeline(DeferredLine(name, line))
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry) -> None:
@@ -307,12 +403,9 @@ class MetalKernel(SIMDKernel):
         with code.indent():
             code.splice(
                 """
-            template<typename T> inline bool isnan(T) { return false; }
-            template<> inline bool isnan(float x) { return metal::isnan(x); }
-            template<> inline bool isnan(half x) { return metal::isnan(x); }
-            #if __METAL_VERSION__ >= 310
-            template<> inline bool isnan(bfloat x) { return metal::isnan(x); }
-            #endif
+            #include <c10/metal/random.h>
+            #include <c10/metal/special_math.h>
+            #include <c10/metal/utils.h>
             """,
                 strip=True,
             )
@@ -358,9 +451,8 @@ class MetalKernel(SIMDKernel):
         args = [arg for arg in args if arg not in self.removed_buffers]
         args += [str(v) for v in self.args.sizevars.keys()]
         if len(self.active_range_trees()) > 0:
-            args += [
-                f"threads=[{', '.join(str(v.numel) for v in self.active_range_trees())}]"
-            ]
+            threads = [self.pexpr(v.numel) for v in self.active_range_trees()]  # type: ignore[misc]
+            args += [f"threads=[{', '.join(threads)}]"]
 
         wrapper.generate_kernel_call(
             name,
@@ -376,8 +468,9 @@ class MetalKernel(SIMDKernel):
             return
         # TODO(malfet): support asserts
         # See https://github.com/pytorch/pytorch/issues/144634
-        lower_expr = f"{self.sexpr(expr)} < 0" if lower else ""
-        upper_expr = f"{self.sexpr(expr)} >= {self.sexpr(size)}" if upper else ""
+        expr_str = self.index_to_str(expr)
+        lower_expr = f"{expr_str} < 0" if lower else ""
+        upper_expr = f"{expr_str} >= {self.index_to_str(size)}" if upper else ""
         if lower and upper:
             line = f"if (({lower_expr}) && ({upper_expr})) return"
         else:
@@ -388,12 +481,13 @@ class MetalKernel(SIMDKernel):
 class MetalScheduling(SIMDScheduling):
     kernel_type = MetalKernel  # type: ignore[assignment]
 
-    def __init__(self, scheduler: Scheduler) -> None:
+    def __init__(self, scheduler: Optional[Scheduler]) -> None:
         super().__init__(scheduler)
         wrapper = V.graph.wrapper_code
-        wrapper.header.splice(
-            "from torch._inductor.runtime.runtime_utils import compile_mps_shader"
-        )
+        if wrapper is not None:
+            wrapper.header.splice(
+                "from torch._inductor.runtime.runtime_utils import compile_mps_shader"
+            )
 
     def define_kernel(
         self, src_code: str, node_schedule: list[SchedulerNode], kernel: MetalKernel
